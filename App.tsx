@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect } from 'react';
-import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, useLocation } from 'react-router-dom';
 import Header from './components/Header';
 import Footer from './components/Footer';
 import LandingPage from './pages/LandingPage';
@@ -33,7 +33,7 @@ const App: React.FC = () => {
   const toggleTheme = () => setIsDarkMode(!isDarkMode);
 
   return (
-    <MemoryRouter>
+    <BrowserRouter>
       <div className={`min-h-screen flex flex-col ${isDarkMode ? 'dark bg-gray-900 text-white' : 'bg-slate-50 text-slate-900'}`}>
         <ScrollToTop />
         <Header isDarkMode={isDarkMode} toggleTheme={toggleTheme} />
@@ -45,7 +45,7 @@ const App: React.FC = () => {
         </main>
         <Footer />
       </div>
-    </MemoryRouter>
+    </BrowserRouter>
   );
 };
 
