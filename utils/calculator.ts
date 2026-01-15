@@ -1,20 +1,21 @@
-
 import { Course, Semester, ProcessedData } from '../types';
 import { BED_COURSES } from '../constants';
 
 // --- Grading Logic ---
 export const calculateQualityPoints = (marks: number, ch: number, grade?: string): number => {
-  if (grade === 'F') return 0;
-  if (grade === 'P') return ch * 4.0; // Pass usually doesn't affect GPA but for display we might need logic
+  // Handle Pass/Fail
+  const g = (grade || '').toUpperCase().trim();
+  if (g === 'F') return 0;
+  if (g === 'P') return ch * 4.0; 
 
-  // Approximation based on standard UAF scale logic (Marks / Max * CH * 4 roughly)
-  // Or the "Rule of Thumb" step logic
+  // Standard UAF Formula Logic
   const maxMarks = ch * 20; 
   if (maxMarks === 0) return 0;
   
-  if (marks > maxMarks) marks = maxMarks; // Cap at max
+  // Cap marks at max (e.g. if teacher gave bonus marks)
+  const adjustedMarks = marks > maxMarks ? maxMarks : marks;
 
-  const percentage = (marks / maxMarks) * 100;
+  const percentage = (adjustedMarks / maxMarks) * 100;
   
   if (percentage >= 80) return ch * 4.00;
   if (percentage < 40) return 0;
@@ -29,55 +30,101 @@ export const calculateQualityPoints = (marks: number, ch: number, grade?: string
 
 export const determineGrade = (marks: number, ch: number): string => {
   const maxMarks = ch * 20;
+  if (maxMarks === 0) return 'F';
   const p = (marks / maxMarks) * 100;
+  
   if (p >= 80) return 'A';
-  if (p >= 65) return 'B';
+  if (p >= 65) return 'B'; // UAF typically uses B for 65+
   if (p >= 50) return 'C';
   if (p >= 40) return 'D';
   return 'F';
 };
 
-// --- Semester Sorting ---
+// --- ROBUST Semester Parsing (Ported from Original) ---
+export const processSemesterName = (semester: string): string => {
+  if (!semester) return 'Unknown Semester';
+  const lower = semester.toLowerCase().trim();
+
+  // Handle "Winter 2020-2021" -> "Winter 2020"
+  const yearRangeMatch = lower.match(/(\d{4})-(\d{2,4})/);
+  const singleYearMatch = lower.match(/\b(\d{4})\b/);
+
+  let season = '';
+  let year = '';
+
+  if (lower.includes('spring')) season = 'Spring';
+  else if (lower.includes('winter')) season = 'Winter';
+  else if (lower.includes('summer')) season = 'Summer';
+  else if (lower.includes('fall')) season = 'Fall';
+  else season = 'Unknown';
+
+  // Extract Year
+  if (yearRangeMatch) {
+    // Usually the first year is the identifier for Winter/Fall, second for Spring
+    // But UAF standardizes often on the "Start" of the academic year or the calendar year
+    // Original logic:
+    if (season === 'Spring') year = `20${yearRangeMatch[2].slice(-2)}`; // 20-21 -> 2021
+    else year = yearRangeMatch[1];
+  } else if (singleYearMatch) {
+    year = singleYearMatch[1];
+  } else {
+    // Fallback for "Winter20" style
+    const shortMatch = lower.match(/(winter|spring|summer|fall)(\d{2})/);
+    if (shortMatch) {
+        year = `20${shortMatch[2]}`;
+    }
+  }
+
+  if (season !== 'Unknown' && year) {
+      return `${season} ${year}`;
+  }
+  
+  // Fallback: Capitalize first letter
+  return semester.charAt(0).toUpperCase() + semester.slice(1);
+};
+
 export const getSemesterSortKey = (semesterName: string): string => {
   const lower = semesterName.toLowerCase();
+  
+  // Forecasts go last
   if (lower.startsWith('forecast')) {
     const num = parseInt(lower.split(' ')[1] || '1');
-    return `3000-${num.toString().padStart(2, '0')}`;
+    return `9999-${num.toString().padStart(2, '0')}`;
   }
 
   const yearMatch = lower.match(/\b(\d{4})\b/);
-  const year = yearMatch ? parseInt(yearMatch[1]) : 9999;
+  const year = yearMatch ? parseInt(yearMatch[1]) : 0;
   
   let seasonOrder = 9;
+  // Academic Year Ordering: Winter -> Spring -> Summer -> Fall (Calendar wise)
   if (lower.includes('winter')) seasonOrder = 1;
   else if (lower.includes('spring')) seasonOrder = 2;
   else if (lower.includes('summer')) seasonOrder = 3;
   else if (lower.includes('fall')) seasonOrder = 4;
 
-  // Adjust year for Spring/Summer which are part of academic year starting prev year
-  // but UAF usually lists them by calendar year. Simple YYYY-Order works best.
   return `${year}-${seasonOrder}`;
 };
 
-// --- B.Ed Filter ---
+// --- Filter Semesters (B.Ed Logic) ---
 export const filterSemesters = (semesters: Record<string, Semester>, includeBed: boolean): Record<string, Semester> => {
   const filtered: Record<string, Semester> = {};
 
   Object.entries(semesters).forEach(([name, sem]) => {
-    // Check if this semester has relevant courses
+    // Filter courses inside the semester
     const relevantCourses = sem.courses.filter(c => {
       const isBed = BED_COURSES.has(c.code.toUpperCase().trim());
       return includeBed ? isBed : !isBed;
     });
 
-    // Also include if it's a forecast semester specifically for this type
     const isRelevantForecast = includeBed ? sem.isBedForecast : (sem.isForecast && !sem.isBedForecast);
 
+    // Only add semester if it has relevant courses OR is a relevant forecast
     if (relevantCourses.length > 0 || isRelevantForecast) {
-      // Deep copy semester but replace courses with filtered list
       filtered[name] = {
         ...sem,
-        courses: relevantCourses
+        courses: relevantCourses,
+        // Recalculate basic stats for this subset (visual only, real recalc happens in recalculateGPA)
+        totalCreditHours: relevantCourses.reduce((sum, c) => sum + (c.isDeleted ? 0 : c.creditHours), 0)
       };
     }
   });
@@ -85,34 +132,40 @@ export const filterSemesters = (semesters: Record<string, Semester>, includeBed:
   return filtered;
 };
 
-// --- Recalculate Totals ---
+// --- Recalculate Totals (The Core Engine) ---
 export const recalculateGPA = (semesters: Record<string, Semester>): { 
   semesters: Record<string, Semester>, 
   overall: { cgpa: number, pct: number, qp: number, ch: number, marks: number, max: number } 
 } => {
   let grandQP = 0, grandCH = 0, grandMarks = 0, grandMax = 0;
   
-  // Track repeats globally
-  const history: Record<string, { marks: number, semName: string, idx: number }[]> = {};
+  // 1. Flatten History to find Repeats
+  const history: Record<string, { marks: number, semName: string, idx: number, grade: string }[]> = {};
 
-  // 1. Build History
   Object.entries(semesters).forEach(([semName, sem]) => {
     sem.courses.forEach((c, idx) => {
-      if (c.isDeleted) return;
-      if (!history[c.code]) history[c.code] = [];
-      history[c.code].push({ marks: c.marks, semName, idx });
+      if (c.isDeleted) return; // Skip deleted
+      const code = c.code.toUpperCase().trim();
+      if (!history[code]) history[code] = [];
+      history[code].push({ marks: c.marks, semName, idx, grade: c.grade || '' });
     });
   });
 
-  // 2. Mark Repeats
+  // 2. Determine Best Attempts
   Object.values(history).forEach(attempts => {
     if (attempts.length > 1) {
-      attempts.sort((a, b) => b.marks - a.marks); // Best marks first
+      // Sort by marks descending. 
+      // Important: If grade is 'F', marks might be high but it's failed. 
+      // However, usually we want the highest marks regardless, or the passed one.
+      // Standard logic: Highest marks is the 'Best Attempt'.
+      attempts.sort((a, b) => b.marks - a.marks); 
+      
       attempts.forEach((att, i) => {
         const sem = semesters[att.semName];
         const course = sem.courses[att.idx];
         course.isRepeated = true;
-        course.isExtraEnrolled = i > 0; // Only first (best) is NOT extra
+        // The first one (index 0) is best. Others are Extra.
+        course.isExtraEnrolled = i > 0; 
       });
     } else if (attempts.length === 1) {
        const sem = semesters[attempts[0].semName];
@@ -122,17 +175,20 @@ export const recalculateGPA = (semesters: Record<string, Semester>): {
     }
   });
 
-  // 3. Calculate Semester & Overall Stats
+  // 3. Calculate Stats
   Object.values(semesters).forEach(sem => {
     let sQP = 0, sCH = 0, sMarks = 0, sMax = 0;
     sem.courses.forEach(c => {
+      // Logic: If Deleted -> Ignore. If ExtraEnrolled -> Ignore for GPA.
       if (!c.isDeleted && !c.isExtraEnrolled) {
         sQP += c.qualityPoints;
         sCH += c.creditHours;
         sMarks += c.marks;
-        sMax += c.creditHours * 20;
+        // Standard Max Marks: 20 marks per Credit Hour (e.g. 3CH = 60)
+        sMax += c.creditHours * 20; 
       }
     });
+    
     sem.gpa = sCH > 0 ? sQP / sCH : 0;
     sem.percentage = sMax > 0 ? (sMarks / sMax) * 100 : 0;
     sem.totalQualityPoints = sQP;
