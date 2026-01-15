@@ -1,0 +1,5 @@
+{
+  "name": "UAF CGPA Calculator - M Saqlain",
+  "description": "A professional, automatic CGPA calculator for University of Agriculture Faisalabad (UAF) students with result fetching, semester forecasting, and PDF export.",
+  "requestFramePermissions": []
+}
