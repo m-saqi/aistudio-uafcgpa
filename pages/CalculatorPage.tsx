@@ -5,7 +5,7 @@ import { Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement
 import { jsPDF } from 'jspdf';
 import 'jspdf-autotable';
 import { BED_COURSES } from '../constants';
-import { calculateQualityPoints, determineGrade, getSemesterSortKey, filterSemesters, recalculateGPA } from '../utils/calculator';
+import { calculateQualityPoints, determineGrade, getSemesterSortKey, filterSemesters, recalculateGPA, processSemesterName } from '../utils/calculator';
 
 // Register ChartJS
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend, Filler);
@@ -48,7 +48,6 @@ const CalculatorPage: React.FC = () => {
       try {
         const parsed = JSON.parse(saved);
         const validProfiles: Record<string, ProcessedData> = {};
-        // Filter out corrupted data
         Object.entries(parsed).forEach(([key, val]: [string, any]) => {
           if (val && val.studentInfo && val.studentInfo.name) {
             validProfiles[key] = val;
@@ -60,7 +59,7 @@ const CalculatorPage: React.FC = () => {
       }
     }
 
-    // Check Server
+    // Check Server Status
     fetch('/api/result-scraper?action=check_status')
       .then(r => r.json())
       .then(d => d.success && setServerStatus({ lms: d.lms_status, ats: d.attnd_status }))
@@ -68,7 +67,6 @@ const CalculatorPage: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    // Save Profiles
     if (Object.keys(profiles).length > 0) {
       localStorage.setItem('uafCalculatorProfiles_v2', JSON.stringify(profiles));
     }
@@ -108,11 +106,11 @@ const CalculatorPage: React.FC = () => {
       }
 
       resData.resultData.forEach((item: RawCourseData) => {
-        let semName = item.Semester.replace(/Semester/i, '').trim().replace(/(\d{4})-\d{4}/, '$1');
-        const semKey = semName; 
+        // Use ROBUST parsing logic
+        const semName = processSemesterName(item.Semester);
         
-        if (!newSemesters[semKey]) {
-          newSemesters[semKey] = {
+        if (!newSemesters[semName]) {
+          newSemesters[semName] = {
             originalName: item.Semester,
             sortKey: getSemesterSortKey(semName),
             courses: [],
@@ -126,7 +124,7 @@ const CalculatorPage: React.FC = () => {
         const ch = parseInt(item.CreditHours.match(/(\d+)/)?.[1] || '0');
         const marks = parseFloat(item.Total) || 0;
         
-        newSemesters[semKey].courses.push({
+        newSemesters[semName].courses.push({
           code,
           title: item.CourseTitle || code,
           creditHours: ch,
@@ -137,7 +135,7 @@ const CalculatorPage: React.FC = () => {
           isExtraEnrolled: false, isRepeated: false, isDeleted: false, isCustom: false,
           source: 'lms',
           teacher: item.TeacherName,
-          originalSemester: semKey
+          originalSemester: semName
         });
       });
 
@@ -179,24 +177,56 @@ const CalculatorPage: React.FC = () => {
     }
     setLoading(true);
     setLoadingStage(1);
-    addLog("Fetching attendance records...");
+    addLog("Checking Attendance System...");
+
+    // 1. Check Cache (10 minutes expiry)
+    const CACHE_KEY = `att_cache_${agNo}`;
+    const CACHE_DURATION = 10 * 60 * 1000;
+    const cached = localStorage.getItem(CACHE_KEY);
+    let resultData = null;
+
+    if (cached) {
+      try {
+        const parsed = JSON.parse(cached);
+        if (Date.now() - parsed.timestamp < CACHE_DURATION) {
+          resultData = parsed.data;
+          addLog("Loaded attendance from cache.", "info");
+        }
+      } catch(e) {}
+    }
 
     try {
-        const res = await fetch(`/api/result-scraper?action=scrape_attendance&registrationNumber=${encodeURIComponent(agNo)}`);
-        const resData = await res.json();
-        
-        if (!resData.success) throw new Error(resData.message || "Failed to fetch attendance");
+        if (!resultData) {
+          const res = await fetch(`/api/result-scraper?action=scrape_attendance&registrationNumber=${encodeURIComponent(agNo)}`);
+          const resJson = await res.json();
+          if (!resJson.success) throw new Error(resJson.message || "Failed to fetch attendance");
+          resultData = resJson.resultData;
+          // Save to cache
+          localStorage.setItem(CACHE_KEY, JSON.stringify({ timestamp: Date.now(), data: resultData }));
+          addLog("Fetched fresh attendance data.", "success");
+        }
 
         let addedCount = 0;
         const newSemesters = { ...data.semesters };
 
-        resData.resultData.forEach((item: RawCourseData) => {
-            let semName = item.Semester.replace(/Semester/i, '').trim().replace(/(\d{4})-\d{4}/, '$1');
+        // 2. Robust Merging Logic
+        resultData.forEach((item: RawCourseData) => {
+            const semName = processSemesterName(item.Semester); // Use standard parsing
             const code = item.CourseCode.trim();
+            const marks = parseFloat(item.Total) || 0;
+            const grade = item.Grade || determineGrade(marks, 3); // Attendance data might lack grade
 
-            const exists = Object.values(newSemesters).some(sem => sem.courses.some(c => c.code === code));
+            // Check if this EXACT course exists (Code + Marks + Grade)
+            // If the code exists but marks/grade are different, it's likely a repeat/improvement -> Add it!
+            const alreadyExists = Object.values(newSemesters).some(sem => 
+                sem.courses.some(c => 
+                    c.code === code && 
+                    Math.abs(c.marks - marks) < 0.1 && // Float comparison
+                    c.grade === grade
+                )
+            );
             
-            if (!exists) {
+            if (!alreadyExists) {
                 if (!newSemesters[semName]) {
                     newSemesters[semName] = {
                         originalName: item.Semester,
@@ -206,17 +236,16 @@ const CalculatorPage: React.FC = () => {
                     };
                 }
 
-                const ch = 3; 
-                const marks = parseFloat(item.Total) || 0;
+                const ch = 3; // Attendance usually doesn't show CH, default to 3
                 
                 newSemesters[semName].courses.push({
                     code,
                     title: item.CourseTitle || code,
                     creditHours: ch,
-                    creditHoursDisplay: "3(3-0)",
+                    creditHoursDisplay: "3(3-0)*",
                     marks,
                     qualityPoints: calculateQualityPoints(marks, ch),
-                    grade: determineGrade(marks, ch),
+                    grade: grade,
                     isExtraEnrolled: false, isRepeated: false, isDeleted: false, isCustom: false,
                     source: 'attendance',
                     originalSemester: semName
@@ -228,9 +257,9 @@ const CalculatorPage: React.FC = () => {
         if (addedCount > 0) {
             const calculated = recalculateGPA(newSemesters);
             updateData({ ...data, semesters: calculated.semesters });
-            addLog(`Merged ${addedCount} courses from Attendance.`, "success");
+            addLog(`Merged ${addedCount} courses from Attendance System.`, "success");
         } else {
-            addLog("No new courses found in Attendance system.", "info");
+            addLog("No new unique courses found in Attendance system.", "info");
         }
 
     } catch (e: any) {
@@ -456,7 +485,7 @@ const CalculatorPage: React.FC = () => {
     
     const newSem = {
       originalName: name,
-      sortKey: `3000-${count.toString().padStart(2, '0')}`,
+      sortKey: `9999-${count.toString().padStart(2, '0')}`,
       courses: [],
       gpa: 0, percentage: 0, totalQualityPoints: 0, totalCreditHours: 0, totalMarksObtained: 0, totalMaxMarks: 0,
       isForecast: true,
